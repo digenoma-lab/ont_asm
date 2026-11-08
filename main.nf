@@ -24,35 +24,23 @@ process BAM_FASTQ {
     """
 }
 
-// Recover the original primary paired reads, including unmapped reads and duplicates.
+// Recover primary reads, including unmapped reads, singletons and duplicates.
 process CRAM_FASTQ {
     tag "$meta.id"
     container 'https://depot.galaxyproject.org/singularity/mulled-v2-580d344d9d4a496cd403932da8765f9e0187774d:df80ed8d23d0a2c43181a2b3dd1b39f2d00fab5c-0'
     input:
-    tuple val(meta), path(cram), path(reference, name: 'reference.fa')
+    tuple val(meta), path(cram), path(reference, name: 'reference.fa'), path(reference_fai, name: 'reference.fa.fai')
     output:
-    tuple val(meta), path('read_1.fastq.gz'), path('read_2.fastq.gz')
+    tuple val(meta), path("${meta.id}.se.sr.fastq.gz")
     script:
     """
     set -o pipefail
-    samtools faidx reference.fa
-    mkfifo read_1.pipe read_2.pipe
-    pigz -p 2 -c < read_1.pipe > read_1.fastq.gz &
-    pid1=\$!
-    pigz -p 2 -c < read_2.pipe > read_2.fastq.gz &
-    pid2=\$!
-    trap 'kill \$pid1 \$pid2 2>/dev/null || true' EXIT
-    samtools view -u -T reference.fa '${cram}' | samtools collate -u -O -T collate_tmp - | samtools fastq -n -F 0x900 -1 read_1.pipe -2 read_2.pipe -0 /dev/null -s /dev/null -
-    wait \$pid1
-    wait \$pid2
-    trap - EXIT
-    test \$(gzip -cd read_1.fastq.gz | wc -c) -gt 0
-    test \$(gzip -cd read_2.fastq.gz | wc -c) -gt 0
+    ${reference_fai ? '' : 'samtools faidx reference.fa'}
+    samtools view -u -T reference.fa '${cram}' | samtools fastq -n -F 0x900 - | pigz -p 4 -c > '${meta.id}.se.sr.fastq.gz'
     """
     stub:
     """
-    printf '@stub\\nACGT\\n+\\nIIII\\n' | gzip -c > read_1.fastq.gz
-    cp read_1.fastq.gz read_2.fastq.gz
+    printf '@stub\\nACGT\\n+\\nIIII\\n' | gzip -c > '${meta.id}.se.sr.fastq.gz'
     """
 }
 
@@ -298,6 +286,18 @@ process REPORT {
 }
 
 workflow {
+    def cramFastqIntermediates = Collections.synchronizedSet([] as Set)
+    workflow.onComplete {
+        if (workflow.success) {
+            cramFastqIntermediates.each { fastq ->
+                try {
+                    java.nio.file.Files.deleteIfExists(fastq)
+                } catch (Exception e) {
+                    log.warn "Could not remove intermediate ${fastq}: ${e.message}"
+                }
+            }
+        }
+    }
     if (!params.input) error 'Provide --input samples.csv'
     if (!params.skip_flagger && !workflow.stubRun) {
         if (!params.flagger_sif) error 'Provide --flagger_sif /shared/path/flagger-v1.2.0.sif (see README), or use --skip_flagger'
@@ -316,26 +316,33 @@ workflow {
         def r2 = row.short_read_2?.trim() ?: ''
         def cram = row.short_read_cram?.trim() ?: ''
         def ref = row.cram_reference?.trim() ?: ''
+        def fai = row.cram_reference_fai?.trim() ?: ''
         if ((!r1) != (!r2)) error "Both short reads must be supplied for ${id}"
         if ((!cram) != (!ref)) error "Both short_read_cram and cram_reference must be supplied for ${id}"
+        if (fai && !ref) error "cram_reference_fai requires a CRAM reference for ${id}"
         if (cram && r1) error "Choose short-read CRAM or paired FASTQs, not both, for ${id}"
         if (r1 && (!(r1.endsWith('.gz')) || !(r2.endsWith('.gz')))) error "Short reads must be gzip-compressed FASTQ for ${id}"
         if (ref && ref.toLowerCase().endsWith('.gz')) error "CRAM reference must be an uncompressed FASTA for ${id}"
         def resolve = { x -> file(java.nio.file.Paths.get(x).isAbsolute() ? x : base.resolve(x), checkIfExists:true) }
-        tuple(id, resolve.call(row.bam.trim()), r1 ? resolve.call(r1) : '', r2 ? resolve.call(r2) : '', cram ? resolve.call(cram) : '', ref ? resolve.call(ref) : '')
-    }.groupTuple().map { id, bams, r1s, r2s, crams, refs ->
-        if ([r1s,r2s,crams,refs].any { it.toSet().size()!=1 }) error "Short-read paths must match across BAM rows for ${id}"
+        def refPath = ref ? resolve.call(ref) : ''
+        def adjacentFai = ref ? file("${refPath}.fai") : null
+        def faiPath = fai ? resolve.call(fai) : (adjacentFai?.exists() ? adjacentFai : '')
+        tuple(id, resolve.call(row.bam.trim()), r1 ? resolve.call(r1) : '', r2 ? resolve.call(r2) : '', cram ? resolve.call(cram) : '', refPath, faiPath)
+    }.groupTuple().map { id, bams, r1s, r2s, crams, refs, fais ->
+        if ([r1s,r2s,crams,refs,fais].any { it.toSet().size()!=1 }) error "Short-read paths must match across BAM rows for ${id}"
         if (bams.toSet().size()!=bams.size()) error "Duplicate BAM for ${id}"
-        tuple([id:id], bams, r1s[0], r2s[0], crams[0], refs[0])
+        tuple([id:id], bams, r1s[0], r2s[0], crams[0], refs[0], fais[0])
     }
     ch_samples = ch_samples.ifEmpty { error 'Samplesheet has no data rows' }
-    ch_samples.multiMap { meta, bams, r1, r2, cram, ref ->
+    ch_samples.multiMap { meta, bams, r1, r2, cram, ref, fai ->
         bam: tuple(meta,bams)
-        shortreads: tuple(meta,r1,r2,cram,ref)
+        shortreads: tuple(meta,r1,r2,cram,ref,fai)
     }.set { inputs }
     BAM_FASTQ(inputs.bam)
     HIFIASM(BAM_FASTQ.out.map { meta, reads -> tuple(meta, reads, []) }, Channel.value(tuple([:], [], [])), Channel.value(tuple([:], [], [])), Channel.value(tuple([:], [])))
-    PIGZ_HIFIASM_OUTPUT(HIFIASM.out.corrected_reads.mix(HIFIASM.out.read_overlaps))
+    if (params.save_hifiasm_extra) {
+        PIGZ_HIFIASM_OUTPUT(HIFIASM.out.corrected_reads.mix(HIFIASM.out.read_overlaps))
+    }
     ch_primary = BAM_FASTQ.out.join(HIFIASM.out.primary_contigs, failOnMismatch:true).map { meta, reads, primary -> tuple(meta, primary) }
     ch_gfas = ch_primary.join(HIFIASM.out.hap1_contigs, failOnMismatch:true).join(HIFIASM.out.hap2_contigs, failOnMismatch:true)
     GFA_FASTA(ch_gfas)
@@ -349,10 +356,14 @@ workflow {
     } else {
         ch_asmgene = inputs.bam.map { meta, bams -> tuple(meta,[]) }
     }
-    ch_cram = inputs.shortreads.filter { meta, r1, r2, cram, ref -> cram }.map { meta, r1, r2, cram, ref -> tuple(meta, cram, ref) }
+    ch_cram = inputs.shortreads.filter { meta, r1, r2, cram, ref, fai -> cram }.map { meta, r1, r2, cram, ref, fai -> tuple(meta, cram, ref, fai ? [fai] : []) }
     CRAM_FASTQ(ch_cram)
-    ch_fastq = inputs.shortreads.filter { meta, r1, r2, cram, ref -> r1 }.map { meta, r1, r2, cram, ref -> tuple(meta, r1, r2) }
-    ch_short = ch_fastq.mix(CRAM_FASTQ.out).map { meta, r1, r2 -> tuple(meta + [single_end:false], [r1,r2]) }
+    ch_fastq = inputs.shortreads.filter { meta, r1, r2, cram, ref, fai -> r1 }.map { meta, r1, r2, cram, ref, fai -> tuple(meta, r1, r2) }
+    ch_cram_fastq = CRAM_FASTQ.out.map { meta, fastq ->
+        cramFastqIntermediates.add(fastq)
+        tuple(meta + [single_end:true], fastq)
+    }
+    ch_short = ch_fastq.map { meta, r1, r2 -> tuple(meta + [single_end:false], [r1,r2]) }.mix(ch_cram_fastq)
     YAK_COUNT(ch_short)
     ch_yakdb = YAK_COUNT.out.yak.map { meta, db -> tuple([id:meta.id], db) }
     YAK_QV(GFA_FASTA.out.join(ch_yakdb))
@@ -361,7 +372,7 @@ workflow {
     FLAGGER(ALIGN_DIPLOID.out.filter { meta, assembly, fai, bam, bai -> !params.skip_flagger }, file("${projectDir}/assets/ont-r10-alpha.tsv"))
     NUCFLAG(ALIGN_DIPLOID.out.filter { meta, assembly, fai, bam, bai -> !params.skip_nucflag })
     ch_nucflag = NUCFLAG.out.mix(inputs.bam.filter { meta,bams -> params.skip_nucflag }.map { meta,bams -> tuple(meta,[]) })
-    ch_yak = YAK_QV.out.mix(inputs.shortreads.filter { meta,r1,r2,cram,ref -> !r1 && !cram }.map { meta,r1,r2,cram,ref -> tuple(meta,[]) })
+    ch_yak = YAK_QV.out.mix(inputs.shortreads.filter { meta,r1,r2,cram,ref,fai -> !r1 && !cram }.map { meta,r1,r2,cram,ref,fai -> tuple(meta,[]) })
     ch_flag = FLAGGER.out.mix(inputs.bam.filter { meta,bams -> params.skip_flagger }.map { meta,bams -> tuple(meta,[]) })
     REPORT(TELO_STATS.out.join(ch_yak).join(ch_flag).join(ASSEMBLY_STATS.out).join(ch_nucflag).join(ch_asmgene))
 }
