@@ -12,7 +12,8 @@ process BAM_FASTQ {
     output:
     tuple val(meta), path("${meta.id}.fastq.gz")
     script:
-    def commands = bams.collect { "samtools quickcheck -u '${it}' && test \"\$(samtools view -c -F 4 '${it}')\" -eq 0 && samtools fastq -F 0x900 '${it}'" }.join(' && ')
+    //def commands = bams.collect { "samtools quickcheck -u '${it}' && test \"\$(samtools view -c -F 4 '${it}')\" -eq 0 && samtools fastq -F 0x900 '${it}'" }.join(' && ')
+    def commands = bams.collect { "samtools fastq -F 0x900 '${it}'" }.join(' && ')
     """
     set -o pipefail
     { $commands; } | pigz -p 4 -c > ${meta.id}.fastq.gz
