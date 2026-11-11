@@ -2,6 +2,7 @@ nextflow.enable.dsl=2
 
 include { HIFIASM } from './modules/nf-core/hifiasm/main'
 include { YAK_COUNT } from './modules/nf-core/yak/count/main'
+include { SEQKIT_STATS } from './modules/nf-core/seqkit/stats/main'
 
 
 process BAM_FASTQ {
@@ -269,12 +270,12 @@ process REPORT {
     container 'https://community-cr-prod.seqera.io/docker/registry/v2/blobs/sha256/c8/c8e346f4f6080eadf1253505e6ff09ef004454fc18e8d672006fd7b222cc412e/data'
     publishDir { "${params.outdir}/${meta.id}" }, mode: 'copy'
     input:
-    tuple val(meta), path(telos), path(sizes), path(yak), path(flagger), path(stats), path(nucflag), path(asmgene)
+    tuple val(meta), path(telos), path(sizes), path(yak), path(flagger), path(stats), path(nucflag), path(asmgene), path(readstats)
     output:
     path 'summary.html'
     path 'summary.tsv'
     script:
-    def opt = "${yak ? '--yak ' + yak.join(' ') : ''} ${flagger ? '--flagger ' + flagger : ''} --stats ${stats.join(' ')} ${nucflag ? '--nucflag ' + nucflag : ''} ${asmgene ? '--asmgene ' + asmgene.join(' ') : ''}"
+    def opt = "${yak ? '--yak ' + yak.join(' ') : ''} ${flagger ? '--flagger ' + flagger : ''} --stats ${stats.join(' ')} ${nucflag ? '--nucflag ' + nucflag : ''} ${asmgene ? '--asmgene ' + asmgene.join(' ') : ''} ${readstats ? '--readstats ' + readstats : ''}"
     """
     assembly_report.py --sample '${meta.id}' --motif '${params.telo_motif}' --telo ${telos.join(' ')} --size ${sizes.join(' ')} $opt
     """
@@ -286,9 +287,10 @@ process REPORT {
 }
 
 workflow {
+    def runMeta = workflow
     def cramFastqIntermediates = Collections.synchronizedSet([] as Set)
     workflow.onComplete {
-        if (workflow.success) {
+        if (runMeta.success) {
             cramFastqIntermediates.each { fastq ->
                 try {
                     java.nio.file.Files.deleteIfExists(fastq)
@@ -339,6 +341,7 @@ workflow {
         shortreads: tuple(meta,r1,r2,cram,ref,fai)
     }.set { inputs }
     BAM_FASTQ(inputs.bam)
+    SEQKIT_STATS(BAM_FASTQ.out)
     HIFIASM(BAM_FASTQ.out.map { meta, reads -> tuple(meta, reads, []) }, Channel.value(tuple([:], [], [])), Channel.value(tuple([:], [], [])), Channel.value(tuple([:], [])))
     if (params.save_hifiasm_extra) {
         PIGZ_HIFIASM_OUTPUT(HIFIASM.out.corrected_reads.mix(HIFIASM.out.read_overlaps))
@@ -374,5 +377,5 @@ workflow {
     ch_nucflag = NUCFLAG.out.mix(inputs.bam.filter { meta,bams -> params.skip_nucflag }.map { meta,bams -> tuple(meta,[]) })
     ch_yak = YAK_QV.out.mix(inputs.shortreads.filter { meta,r1,r2,cram,ref,fai -> !r1 && !cram }.map { meta,r1,r2,cram,ref,fai -> tuple(meta,[]) })
     ch_flag = FLAGGER.out.mix(inputs.bam.filter { meta,bams -> params.skip_flagger }.map { meta,bams -> tuple(meta,[]) })
-    REPORT(TELO_STATS.out.join(ch_yak).join(ch_flag).join(ASSEMBLY_STATS.out).join(ch_nucflag).join(ch_asmgene))
+    REPORT(TELO_STATS.out.join(ch_yak).join(ch_flag).join(ASSEMBLY_STATS.out).join(ch_nucflag).join(ch_asmgene).join(SEQKIT_STATS.out.stats))
 }

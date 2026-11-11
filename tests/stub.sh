@@ -20,7 +20,7 @@ for mode in full skip asmgene; do
   test -s "$tmp/$mode/e/summary.tsv"
   test -f "$tmp/$mode/c/qc/hap1.yak.qv.txt"
   test -f "$tmp/$mode/a/qc/hap1.yak.qv.txt"
-  if find "$tmp/work" -name 'a.se.sr.fastq.gz' -print -quit | grep -q .; then
+  if find "$tmp/work" -type f -name 'a.se.sr.fastq.gz' -print -quit | grep -q .; then
     echo 'CRAM FASTQ intermediate was not removed after success' >&2
     exit 1
   fi
@@ -32,6 +32,7 @@ for mode in full skip asmgene; do
   fi
   test ! -e "$tmp/$mode/b/qc/hap1.yak.qv.txt"
   test -f "$tmp/$mode/a/qc/hap1.gfastats.txt"
+  test -f "$tmp/$mode/a/qc/a.read_stats.tsv"
   if [[ "$mode" == asmgene ]]; then test -f "$tmp/$mode/a/asmgene/hap1.asmgene.tsv"; fi
   if [[ "$mode" != skip ]]; then test -f "$tmp/$mode/a/nucflag/nucflag.bed"; fi
   if [[ "$mode" == full ]]; then test -f "$tmp/$mode/a/flagger/flagger_results/prediction_summary_final.tsv"; fi
